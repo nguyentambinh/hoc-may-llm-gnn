@@ -1,0 +1,15 @@
+# Nguyễn Tâm Bình - 2324801030003
+defaults:
+  batch_size: 1000
+  max_nodes: 500
+  shard_size: 5000
+  timeout: 600
+  tmp: .cache/joern
+  c2cpg_defines: ["OPPROTO=", "STATUS_PARAM=", "STATUS_VAR=", "STATUS_PARAM_ONLY=", "STATUS(x)=x"]
+  seed: 42
+datasets:
+  r2vul:
+    raw: r2vul/goc
+    interim: data/interim/r2vul
+    graphs: data/graphs/r2vul
+    embeddings: data/embeddings/r2vul

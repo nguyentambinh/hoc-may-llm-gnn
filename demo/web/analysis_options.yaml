@@ -1,0 +1,12 @@
+# Nguyễn Tâm Bình - 2324801030003
+include: package:flutter_lints/flutter.yaml
+
+analyzer:
+  exclude:
+    - build/**
+    - android/**
+    - ios/**
+    - web/**
+    - windows/**
+    - macos/**
+    - linux/**

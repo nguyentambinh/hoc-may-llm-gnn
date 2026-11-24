@@ -1,0 +1,23 @@
+# Nguyễn Tâm Bình - 2324801030003
+name: hocmay-vuldet
+
+services:
+  vuldet:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: hocmay-vuldet:latest
+    container_name: hocmay-vuldet
+    working_dir: /work
+    volumes:
+      - ..:/work
+    mem_limit: 9g
+    memswap_limit: 9g
+    cpus: 6
+    cpu_shares: 256
+    environment:
+      OMP_NUM_THREADS: "4"
+      HF_HOME: /work/.cache/hf
+      JAVA_OPTS: -Xmx4g
+    command: sleep infinity
+    restart: unless-stopped

@@ -1,0 +1,285 @@
+# Nguyễn Tâm Bình - 2324801030003
+import json
+from pathlib import Path
+
+NOTEBOOK = r'''{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Tinh chỉnh Qwen2.5-Coder-1.5B bằng LoRA trên R2Vul\n",
+    "Nhóm em dùng 5 ngôn ngữ C, C#, Java, JavaScript, Python; giữ nguyên tập chia của tác giả. Đầu vào 2048 token, LoRA r=16, alpha=32, 2 epoch trên Colab T4. Chọn epoch theo AUROC phần C của valid. Đặt ba tệp interim R2Vul `train.jsonl`, `valid.jsonl`, `test.jsonl` trong `Drive của tôi/hocmay_lora/r2vul5/`. Kết quả lưu tại cùng thư mục; có thể chạy tiếp từ checkpoint.\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "source": [
+    "# Nguyễn Tâm Bình - 2324801030003\n",
+    "DATASET = \"r2vul5\"\n",
+    "from pathlib import Path\n",
+    "DRIVE = Path(\"/content/drive/MyDrive/hocmay_lora\")\n",
+    "MODEL = \"Qwen/Qwen2.5-Coder-1.5B\"\n",
+    "CFG = dict(epochs=2)\n",
+    "MAX_LEN, BATCH, ACCUM, LR, SEED, SAVE_EVERY = 2048, 2, 16, 1e-4, 42, 100\n",
+    "import torch\n",
+    "if not torch.cuda.is_available():\n",
+    "    raise RuntimeError(\"Không có GPU. Chọn Runtime > Change runtime type > T4 GPU rồi chạy lại.\")\n",
+    "print(\"GPU:\", torch.cuda.get_device_name(0), \"| Bộ:\", DATASET)"
+   ],
+   "outputs": [],
+   "execution_count": null
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Mount Drive, tải dữ liệu, cài thư viện"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "source": [
+    "# Nguyễn Tâm Bình - 2324801030003\n",
+    "from google.colab import drive\n",
+    "drive.mount(\"/content/drive\")\n",
+    "OUT = DRIVE / DATASET\n",
+    "OUT.mkdir(parents=True, exist_ok=True)\n",
+    "import subprocess, importlib.util\n",
+    "if importlib.util.find_spec(\"torchao\") is not None:\n",
+    "    subprocess.run([\"pip\", \"uninstall\", \"-y\", \"-q\", \"torchao\"], check=True)\n",
+    "    importlib.invalidate_caches()\n",
+    "if importlib.util.find_spec(\"peft\") is None:\n",
+    "    subprocess.run([\"pip\", \"install\", \"-q\", \"peft\"], check=True)\n",
+    "import shutil\n",
+    "from google.colab import files\n",
+    "data_dir = OUT\n",
+    "for ten in (\"train.jsonl\", \"valid.jsonl\", \"test.jsonl\"):\n",
+    "    if not (data_dir / ten).exists():\n",
+    "        print(\"Chưa có\", ten, \"trong\", data_dir, \"- chọn tệp này trên máy để tải lên\")\n",
+    "        up = files.upload()\n",
+    "        shutil.move(next(iter(up)), data_dir / ten)\n",
+    "print(sorted(p.name for p in data_dir.iterdir()))"
+   ],
+   "outputs": [],
+   "execution_count": null
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Chuẩn bị dữ liệu và mô hình"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "source": [
+    "# Nguyễn Tâm Bình - 2324801030003\n",
+    "import json, math, random, numpy as np\n",
+    "from transformers import AutoTokenizer, AutoModelForSequenceClassification\n",
+    "from peft import LoraConfig, get_peft_model\n",
+    "def load(split):\n",
+    "    with open(data_dir / f\"{split}.jsonl\", encoding=\"utf-8\") as f:\n",
+    "        return [json.loads(line) for line in f]\n",
+    "splits = {s: load(s) for s in (\"train\", \"valid\", \"test\")}\n",
+    "LANG = {r[\"id\"]: r[\"lang\"] for rows in splits.values() for r in rows}\n",
+    "train = splits[\"train\"]\n",
+    "tok = AutoTokenizer.from_pretrained(MODEL)\n",
+    "tok.padding_side = \"right\"\n",
+    "def encode(rows):\n",
+    "    ids = tok([r[\"func\"] for r in rows], truncation=True, max_length=MAX_LEN, add_special_tokens=True)[\"input_ids\"]\n",
+    "    return [(r[\"id\"], r[\"target\"], x) for r, x in zip(rows, ids)]\n",
+    "data = {\"train\": encode(train), \"valid\": encode(splits[\"valid\"]), \"test\": encode(splits[\"test\"])}\n",
+    "pos = sum(t for _, t, _ in data[\"train\"])\n",
+    "weights = torch.tensor([len(data[\"train\"]) / (2 * (len(data[\"train\"]) - pos)), len(data[\"train\"]) / (2 * pos)], device=\"cuda\")\n",
+    "print({k: len(v) for k, v in data.items()}, \"dương tính train:\", pos, \"trọng số lớp:\", weights.tolist())\n",
+    "model = AutoModelForSequenceClassification.from_pretrained(MODEL, num_labels=2)\n",
+    "model.config.pad_token_id = tok.pad_token_id\n",
+    "model.config.use_cache = False\n",
+    "model = model.half().cuda()\n",
+    "model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={\"use_reentrant\": False})\n",
+    "lora = LoraConfig(task_type=\"SEQ_CLS\", r=16, lora_alpha=32, lora_dropout=0.05, target_modules=[\"q_proj\", \"k_proj\", \"v_proj\", \"o_proj\", \"gate_proj\", \"up_proj\", \"down_proj\"])\n",
+    "model = get_peft_model(model, lora)\n",
+    "for p in model.parameters():\n",
+    "    if p.requires_grad:\n",
+    "        p.data = p.data.float()\n",
+    "model.print_trainable_parameters()"
+   ],
+   "outputs": [],
+   "execution_count": null
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Huấn luyện (checkpoint mỗi 100 bước, chọn epoch theo AUROC phần C của valid)\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "source": [
+    "# Nguyễn Tâm Bình - 2324801030003\n",
+    "from sklearn.metrics import roc_auc_score, average_precision_score\n",
+    "def batches(items, seed):\n",
+    "    order = list(range(len(items)))\n",
+    "    random.Random(seed).shuffle(order)\n",
+    "    groups = [order[i:i + BATCH * 50] for i in range(0, len(order), BATCH * 50)]\n",
+    "    out = []\n",
+    "    for g in groups:\n",
+    "        g = sorted(g, key=lambda i: len(items[i][2]))\n",
+    "        out += [g[i:i + BATCH] for i in range(0, len(g), BATCH)]\n",
+    "    random.Random(seed + 1).shuffle(out)\n",
+    "    return out\n",
+    "def collate(items, idx):\n",
+    "    width = max(len(items[i][2]) for i in idx)\n",
+    "    ids = torch.full((len(idx), width), tok.pad_token_id, dtype=torch.long)\n",
+    "    mask = torch.zeros((len(idx), width), dtype=torch.long)\n",
+    "    for row, i in enumerate(idx):\n",
+    "        seq = items[i][2]\n",
+    "        ids[row, :len(seq)] = torch.tensor(seq)\n",
+    "        mask[row, :len(seq)] = 1\n",
+    "    return ids.cuda(), mask.cuda(), torch.tensor([items[i][1] for i in idx]).cuda()\n",
+    "@torch.no_grad()\n",
+    "def predict(items):\n",
+    "    model.eval()\n",
+    "    order = sorted(range(len(items)), key=lambda i: len(items[i][2]))\n",
+    "    probs = np.zeros(len(items), dtype=np.float32)\n",
+    "    for k in range(0, len(order), BATCH * 2):\n",
+    "        idx = order[k:k + BATCH * 2]\n",
+    "        ids, mask, _ = collate(items, idx)\n",
+    "        with torch.autocast(\"cuda\", dtype=torch.float16):\n",
+    "            logits = model(input_ids=ids, attention_mask=mask).logits.float()\n",
+    "        probs[idx] = torch.softmax(logits, -1)[:, 1].cpu().numpy()\n",
+    "    model.train()\n",
+    "    return probs\n",
+    "trainable = [p for p in model.parameters() if p.requires_grad]\n",
+    "opt = torch.optim.AdamW(trainable, lr=LR, weight_decay=0.01)\n",
+    "steps_per_epoch = math.ceil(len(batches(data[\"train\"], SEED)) / ACCUM)\n",
+    "total = steps_per_epoch * CFG[\"epochs\"]\n",
+    "sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, (s + 1) / max(1, int(0.05 * total))) * max(0.0, (total - s) / total))\n",
+    "scaler = torch.amp.GradScaler(\"cuda\")\n",
+    "loss_fn = torch.nn.CrossEntropyLoss(weight=weights)\n",
+    "state = {\"epoch\": 0, \"step\": 0, \"best_auroc\": -1.0, \"history\": []}\n",
+    "ck = OUT / \"checkpoint.pt\"\n",
+    "if ck.exists():\n",
+    "    saved = torch.load(ck, map_location=\"cuda\", weights_only=False)\n",
+    "    model.load_state_dict(saved[\"model\"], strict=False)\n",
+    "    opt.load_state_dict(saved[\"opt\"]); sched.load_state_dict(saved[\"sched\"]); scaler.load_state_dict(saved[\"scaler\"])\n",
+    "    state = saved[\"state\"]\n",
+    "    print(\"Tiếp tục từ epoch\", state[\"epoch\"], \"bước\", state[\"step\"])\n",
+    "def trainable_state():\n",
+    "    return {k: v.detach().cpu() for k, v in model.state_dict().items() if \"lora_\" in k or \"score\" in k}\n",
+    "def save():\n",
+    "    tmp = OUT / \"checkpoint.tmp\"\n",
+    "    torch.save({\"model\": trainable_state(), \"opt\": opt.state_dict(), \"sched\": sched.state_dict(), \"scaler\": scaler.state_dict(), \"state\": state}, tmp)\n",
+    "    tmp.replace(ck)\n",
+    "import time\n",
+    "model.train()\n",
+    "while state[\"epoch\"] < CFG[\"epochs\"]:\n",
+    "    plan = batches(data[\"train\"], SEED + state[\"epoch\"])\n",
+    "    start, t0, running = state[\"step\"] * ACCUM, time.time(), []\n",
+    "    for b in range(start, len(plan)):\n",
+    "        ids, mask, y = collate(data[\"train\"], plan[b])\n",
+    "        with torch.autocast(\"cuda\", dtype=torch.float16):\n",
+    "            logits = model(input_ids=ids, attention_mask=mask).logits.float()\n",
+    "        loss = loss_fn(logits, y) / ACCUM\n",
+    "        scaler.scale(loss).backward()\n",
+    "        running.append(loss.item() * ACCUM)\n",
+    "        if (b + 1) % ACCUM == 0 or b + 1 == len(plan):\n",
+    "            scaler.unscale_(opt)\n",
+    "            torch.nn.utils.clip_grad_norm_(trainable, 1.0)\n",
+    "            scaler.step(opt); scaler.update(); opt.zero_grad(set_to_none=True); sched.step()\n",
+    "            state[\"step\"] += 1\n",
+    "            if state[\"step\"] % 20 == 0:\n",
+    "                done = (b + 1 - start) / (time.time() - t0)\n",
+    "                print(f\"epoch {state['epoch'] + 1} bước {state['step']}/{steps_per_epoch} loss {np.mean(running[-80:]):.4f} còn khoảng {(len(plan) - b - 1) / done / 60:.0f} phút\", flush=True)\n",
+    "            if state[\"step\"] % SAVE_EVERY == 0:\n",
+    "                save()\n",
+    "    probs = predict(data[\"valid\"])\n",
+    "    y = np.array([t for _, t, _ in data[\"valid\"]])\n",
+    "    la_c = np.array([LANG[i] == \"c\" for i, _, _ in data[\"valid\"]])\n",
+    "    auroc, auprc = roc_auc_score(y[la_c], probs[la_c]), average_precision_score(y[la_c], probs[la_c])\n",
+    "    auroc_all = roc_auc_score(y, probs)\n",
+    "    state[\"history\"].append({\"epoch\": state[\"epoch\"] + 1, \"valid_auroc\": float(auroc), \"valid_auprc\": float(auprc), \"valid_auroc_5ngon_ngu\": float(auroc_all)})\n",
+    "    print(\"epoch\", state[\"epoch\"] + 1, \"valid C AUROC\", round(auroc, 4), \"AUPRC\", round(auprc, 4), \"| cả 5 ngôn ngữ AUROC\", round(auroc_all, 4), flush=True)\n",
+    "    if auroc > state[\"best_auroc\"]:\n",
+    "        state[\"best_auroc\"] = float(auroc)\n",
+    "        torch.save(trainable_state(), OUT / \"best_adapter.pt\")\n",
+    "    state[\"epoch\"] += 1\n",
+    "    state[\"step\"] = 0\n",
+    "    save()\n",
+    "print(\"Xong huấn luyện:\", state[\"history\"])"
+   ],
+   "outputs": [],
+   "execution_count": null
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Dự đoán valid, test bằng epoch tốt nhất và ghi kết quả lên Drive"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "source": [
+    "# Nguyễn Tâm Bình - 2324801030003\n",
+    "import csv\n",
+    "from sklearn.metrics import f1_score\n",
+    "model.load_state_dict(torch.load(OUT / \"best_adapter.pt\", map_location=\"cuda\"), strict=False)\n",
+    "for split in (\"valid\", \"test\"):\n",
+    "    path = OUT / f\"pred_{split}.csv\"\n",
+    "    if path.exists():\n",
+    "        continue\n",
+    "    probs = predict(data[split])\n",
+    "    tmp = OUT / f\"pred_{split}.tmp\"\n",
+    "    with open(tmp, \"w\", newline=\"\", encoding=\"utf-8\") as f:\n",
+    "        w = csv.writer(f)\n",
+    "        w.writerow([\"id\", \"lang\", \"target\", \"prob\"])\n",
+    "        for (i, t, _), p in zip(data[split], probs):\n",
+    "            w.writerow([i, LANG[i], t, f\"{p:.6f}\"])\n",
+    "    tmp.replace(path)\n",
+    "    y = np.array([t for _, t, _ in data[split]])\n",
+    "    la = np.array([LANG[i] for i, _, _ in data[split]])\n",
+    "    for ng in (\"c\", \"c_sharp\", \"java\", \"javascript\", \"python\"):\n",
+    "        m = la == ng\n",
+    "        print(split, ng, \"AUROC\", round(roc_auc_score(y[m], probs[m]), 4), \"F1@0.5\", round(f1_score(y[m], probs[m] >= 0.5), 4))\n",
+    "info = {\"dataset\": DATASET, \"model\": MODEL, \"lora\": {\"r\": 16, \"alpha\": 32, \"dropout\": 0.05, \"modules\": \"q,k,v,o,gate,up,down\"}, \"max_len\": MAX_LEN, \"batch\": BATCH * ACCUM, \"lr\": LR, \"seed\": SEED, \"train_size\": len(data[\"train\"]), \"class_weights\": weights.tolist(), \"history\": state[\"history\"]}\n",
+    "(OUT / \"info.json\").write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding=\"utf-8\")\n",
+    "(OUT / \"XONG\").touch()\n",
+    "ck.unlink(missing_ok=True)\n",
+    "print(\"Đã ghi\", sorted(p.name for p in OUT.iterdir()))"
+   ],
+   "outputs": [],
+   "execution_count": null
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "name": "python"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 0
+}
+'''
+
+
+def main():
+    path = Path(__file__).with_name("colab_lora_r2vul5.ipynb")
+    path.write_text(json.dumps(json.loads(NOTEBOOK), ensure_ascii=False, indent=1) + "\n", encoding="utf-8", newline="\n")
+    print(path)
+
+
+if __name__ == "__main__":
+    main()

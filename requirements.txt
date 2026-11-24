@@ -1,0 +1,25 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.5.1+cpu
+torch_geometric
+transformers>=4.40,<5
+scikit-learn
+networkx
+numpy
+pandas
+pyyaml
+tqdm
+gdown
+pyarrow
+matplotlib
+peft
+anthropic
+fastapi
+uvicorn
+tree-sitter
+tree-sitter-c
+tree-sitter-cpp
+tree-sitter-c-sharp
+tree-sitter-java
+tree-sitter-javascript
+tree-sitter-python
+pytest
